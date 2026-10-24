@@ -1,18 +1,19 @@
 package com.capstone.Capstone.project.service;
 
 import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
+import java.util.Objects;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 
 import com.capstone.Capstone.project.exception.BadRequestException;
@@ -28,88 +29,65 @@ import com.capstone.Capstone.project.model.Money;
 import com.capstone.Capstone.project.model.PageResponse;
 
 /**
- * Read-only book catalogue backed by in-memory seed data taken from the wireframes.
- * Ids are derived from names so they stay stable across restarts.
+ * Read-only book catalogue stored in PostgreSQL (tables created and seeded by Flyway).
+ * Every value reaching SQL is a bind parameter; the only concatenated fragments are fixed
+ * strings chosen by this class, never user input.
  */
 @Service
 public class CatalogService {
 
-	private static final String ENGLISH = "English";
 	private static final int DELIVERY_DAYS = 3;
+	private static final char LIKE_ESCAPE = '!';
 
-	private final List<Category> categories = new ArrayList<>();
-	private final Map<UUID, Author> authorsById = new LinkedHashMap<>();
-	private final Map<UUID, Book> booksById = new LinkedHashMap<>();
-	private final List<UUID> recommended = new ArrayList<>();
-	private final List<UUID> bestsellers = new ArrayList<>();
-	private final List<UUID> newLaunches = new ArrayList<>();
+	private static final String BOOK_COLUMNS = "b.id, b.title, b.short_description, b.description, "
+			+ "b.cover_image_url, b.book_format, b.price, b.currency, b.language, b.isbn, b.publisher, "
+			+ "b.published_date, b.page_count, b.in_stock, b.rating";
 
-	public CatalogService() {
-		for (String name : List.of("Romance", "Mystery", "Science Fiction", "Fantasy", "Historical", "Biography",
-				"Self-help", "Memoir", "Travel", "Cooking", "Children's", "Young Adult", "Comics & Graphic Novels",
-				"Poetry", "Drama", "Science", "Philosophy", "Religion", "Language Learning")) {
-			categories.add(new Category(stableId("category", name), name));
-		}
+	private record BookRow(UUID id, String title, String shortDescription, String description,
+			String coverImageUrl, BookFormat format, Money price, String language, String isbn,
+			String publisher, LocalDate publishedDate, Integer pageCount, boolean inStock, Double rating) {
+	}
 
-		addAuthor("Arjun Patel", "Writes about focus, habits and deliberate work.");
-		addAuthor("Raj Patel", "Educator and writer on lifelong learning.");
-		addAuthor("James Wright", "Author of practical guides to goal setting.");
-		addAuthor("James Adams", "Writer of atmospheric thrillers.");
-		addAuthor("Jessica Martin", "Romance and drama novelist.");
-		addAuthor("Laura Mitchell", "Science fiction author.");
-		addAuthor("Daniel Reed", "Minimalism advocate and essayist.");
-		addAuthor("Clara Nelson", "Author of mystery and horror fiction.");
-		addAuthor("Emily Parker", "Children's author.");
+	private record Link<T>(UUID bookId, T value) {
+	}
 
-		recommended.add(addBook("The Art of Focus", "Arjun Patel",
-				"Practical guide to mastering focus & boosting productivity every day.",
-				BookFormat.PAPERBACK, List.of("Non-fiction", "Self Help"), 399, List.of("Self-help"),
-				LocalDate.of(2024, 3, 12), 240, 4.5));
-		recommended.add(addBook("The Art of Learning", "Raj Patel",
-				"Master the mindset and methods for effective lifelong learning.",
-				BookFormat.PAPERBACK, List.of("Non-fiction", "Self Help"), 259, List.of("Self-help"),
-				LocalDate.of(2023, 8, 1), 210, 4.3));
-		recommended.add(addBook("The Path to Success", "James Wright",
-				"A practical guide to achieving goals with clarity and confidence.",
-				BookFormat.PAPERBACK, List.of("Non-fiction", "Self Help"), 359, List.of("Self-help"),
-				LocalDate.of(2022, 11, 20), 280, 4.1));
+	private static final RowMapper<BookRow> BOOK_ROW = (rs, n) -> new BookRow(
+			rs.getObject("id", UUID.class),
+			rs.getString("title"),
+			rs.getString("short_description"),
+			rs.getString("description"),
+			rs.getString("cover_image_url"),
+			BookFormat.valueOf(rs.getString("book_format")),
+			new Money(rs.getBigDecimal("price"), rs.getString("currency")),
+			rs.getString("language"),
+			rs.getString("isbn"),
+			rs.getString("publisher"),
+			rs.getObject("published_date", LocalDate.class),
+			rs.getObject("page_count", Integer.class),
+			rs.getBoolean("in_stock"),
+			toDouble(rs.getBigDecimal("rating")));
 
-		bestsellers.add(addBook("The Midnight Hour", "James Adams",
-				"Haunting tale of a man's journey & the shadows of a forgotten past.",
-				BookFormat.PAPERBACK, List.of("Fiction", "Thriller", "Horror"), 299, List.of("Mystery"),
-				LocalDate.of(2024, 6, 5), 320, 4.7));
-		bestsellers.add(addBook("Beneath the Stars", "Jessica Martin",
-				"A heartwarming tale, where two souls discover who you need.",
-				BookFormat.HARDCOVER, List.of("Fiction", "Love", "Drama"), 499, List.of("Romance", "Drama"),
-				LocalDate.of(2024, 2, 14), 360, 4.6));
-		bestsellers.add(addBook("The Final Frontier", "Laura Mitchell",
-				"A mission to space secrets to change humanity forever.",
-				BookFormat.PAPERBACK, List.of("Fiction", "Thriller"), 359, List.of("Science Fiction"),
-				LocalDate.of(2024, 1, 9), 400, 4.4));
+	private static final RowMapper<Author> AUTHOR_ROW = (rs, n) -> new Author(
+			rs.getObject("id", UUID.class), rs.getString("name"), rs.getString("bio"),
+			rs.getString("photo_url"), null);
 
-		newLaunches.add(addBook("Joy of Minimalism", "Daniel Reed",
-				"Declutter your life to uncover peace, clarity, and joy.",
-				BookFormat.PAPERBACK, List.of("Non-fiction", "Self Help"), 149, List.of("Self-help"),
-				LocalDate.of(2025, 7, 1), 180, 4.0));
-		newLaunches.add(addBook("The Vanishing House", "Clara Nelson",
-				"A chilling mystery unfolds within a house that disappears.",
-				BookFormat.EBOOK, List.of("Fiction", "Horror"), 99, List.of("Mystery"),
-				LocalDate.of(2025, 7, 10), 260, 4.2));
-		newLaunches.add(addBook("The Lost Kitten", "Emily Parker",
-				"A heartwarming tale of courage, friendship, and feline adventure.",
-				BookFormat.HARDCOVER, List.of("Fiction", "Children"), 339, List.of("Children's"),
-				LocalDate.of(2025, 7, 15), 120, 4.8));
+	private final JdbcClient jdbc;
+
+	public CatalogService(JdbcClient jdbc) {
+		this.jdbc = jdbc;
 	}
 
 	// ---- catalogue -------------------------------------------------------------------------
 
 	public HomeSections home(int limit) {
-		return new HomeSections(summaries(recommended, limit), summaries(bestsellers, limit),
-				summaries(newLaunches, limit));
+		return new HomeSections(section("RECOMMENDED", limit), section("BESTSELLERS", limit),
+				section("NEW_LAUNCHES", limit));
 	}
 
 	public List<Category> categories() {
-		return List.copyOf(categories);
+		return jdbc.sql("SELECT id, name FROM categories ORDER BY sort_order")
+				.query((rs, n) -> new Category(rs.getObject("id", UUID.class), rs.getString("name")))
+				.list();
 	}
 
 	public PageResponse<BookSummary> search(String q, UUID categoryId, UUID authorId, String language,
@@ -117,124 +95,220 @@ public class CatalogService {
 		if (minPrice != null && maxPrice != null && minPrice.compareTo(maxPrice) > 0) {
 			throw new BadRequestException("minPrice must not exceed maxPrice");
 		}
-		String needle = q == null || q.isBlank() ? null : q.trim().toLowerCase(Locale.ROOT);
 
-		List<Book> matches = booksById.values().stream()
-				.filter(b -> needle == null || matchesText(b, needle))
-				.filter(b -> categoryId == null || b.categories().stream().anyMatch(c -> c.id().equals(categoryId)))
-				.filter(b -> authorId == null || b.authors().stream().anyMatch(a -> a.id().equals(authorId)))
-				.filter(b -> language == null || b.language().equalsIgnoreCase(language))
-				.filter(b -> format == null || b.format() == format)
-				.filter(b -> minPrice == null || b.price().amount().compareTo(minPrice) >= 0)
-				.filter(b -> maxPrice == null || b.price().amount().compareTo(maxPrice) <= 0)
-				.sorted(comparator(sort))
-				.toList();
+		StringBuilder where = new StringBuilder(" WHERE 1 = 1");
+		Map<String, Object> params = new HashMap<>();
+		if (q != null && !q.isBlank()) {
+			where.append(" AND (LOWER(b.title) LIKE :q ESCAPE '").append(LIKE_ESCAPE).append("'")
+					.append(" OR LOWER(b.short_description) LIKE :q ESCAPE '").append(LIKE_ESCAPE).append("'")
+					.append(" OR EXISTS (SELECT 1 FROM book_authors ba JOIN authors a ON a.id = ba.author_id")
+					.append(" WHERE ba.book_id = b.id AND LOWER(a.name) LIKE :q ESCAPE '")
+					.append(LIKE_ESCAPE).append("'))");
+			params.put("q", likePattern(q));
+		}
+		if (categoryId != null) {
+			where.append(" AND EXISTS (SELECT 1 FROM book_categories bc WHERE bc.book_id = b.id"
+					+ " AND bc.category_id = :categoryId)");
+			params.put("categoryId", categoryId);
+		}
+		if (authorId != null) {
+			where.append(" AND EXISTS (SELECT 1 FROM book_authors ba2 WHERE ba2.book_id = b.id"
+					+ " AND ba2.author_id = :authorId)");
+			params.put("authorId", authorId);
+		}
+		if (language != null && !language.isBlank()) {
+			where.append(" AND LOWER(b.language) = :language");
+			params.put("language", language.trim().toLowerCase(Locale.ROOT));
+		}
+		if (format != null) {
+			where.append(" AND b.book_format = :format");
+			params.put("format", format.name());
+		}
+		if (minPrice != null) {
+			where.append(" AND b.price >= :minPrice");
+			params.put("minPrice", minPrice);
+		}
+		if (maxPrice != null) {
+			where.append(" AND b.price <= :maxPrice");
+			params.put("maxPrice", maxPrice);
+		}
 
-		List<BookSummary> summaries = matches.stream().map(b -> view(b).toSummary()).toList();
-		return PageResponse.of(summaries, page, size);
+		long total = jdbc.sql("SELECT COUNT(*) FROM books b" + where).params(params).query(Long.class).single();
+
+		Map<String, Object> pageParams = new HashMap<>(params);
+		pageParams.put("limit", size);
+		pageParams.put("offset", (long) page * size);
+		List<BookRow> rows = jdbc.sql("SELECT " + BOOK_COLUMNS + " FROM books b" + where
+				+ " ORDER BY " + orderBy(sort) + " LIMIT :limit OFFSET :offset")
+				.params(pageParams).query(BOOK_ROW).list();
+
+		List<BookSummary> content = assemble(rows).stream().map(Book::toSummary).toList();
+		return PageResponse.of(content, page, size, total);
 	}
 
 	public Book getBook(UUID id) {
-		Book book = booksById.get(id);
-		if (book == null) {
-			throw new NotFoundException("Book not found");
-		}
-		return view(book);
+		BookRow row = jdbc.sql("SELECT " + BOOK_COLUMNS + " FROM books b WHERE b.id = :id")
+				.param("id", id).query(BOOK_ROW).optional()
+				.orElseThrow(() -> new NotFoundException("Book not found"));
+		return assemble(List.of(row)).get(0);
 	}
 
 	public List<BookSummary> related(UUID id, int limit) {
-		Book base = booksById.get(id);
-		if (base == null) {
-			throw new NotFoundException("Book not found");
+		getBook(id);
+		List<BookRow> rows = jdbc.sql("SELECT " + BOOK_COLUMNS + " FROM books b WHERE b.id <> :id AND ("
+				+ "EXISTS (SELECT 1 FROM book_categories c1 JOIN book_categories c2"
+				+ " ON c1.category_id = c2.category_id WHERE c1.book_id = :id AND c2.book_id = b.id)"
+				+ " OR EXISTS (SELECT 1 FROM book_authors a1 JOIN book_authors a2"
+				+ " ON a1.author_id = a2.author_id WHERE a1.book_id = :id AND a2.book_id = b.id))"
+				+ " ORDER BY b.catalog_rank LIMIT :limit")
+				.param("id", id).param("limit", limit).query(BOOK_ROW).list();
+		return assemble(rows).stream().map(Book::toSummary).toList();
+	}
+
+	/** Summaries for the given ids, keyed in the order supplied. Unknown ids are skipped. */
+	public Map<UUID, BookSummary> summariesById(Collection<UUID> ids) {
+		Map<UUID, BookSummary> found = new HashMap<>();
+		if (!ids.isEmpty()) {
+			List<BookRow> rows = jdbc.sql("SELECT " + BOOK_COLUMNS + " FROM books b WHERE b.id IN (:ids)")
+					.param("ids", List.copyOf(ids)).query(BOOK_ROW).list();
+			assemble(rows).forEach(b -> found.put(b.id(), b.toSummary()));
 		}
-		Set<UUID> categoryIds = base.categories().stream().map(Category::id).collect(Collectors.toSet());
-		Set<UUID> authorIds = base.authors().stream().map(AuthorSummary::id).collect(Collectors.toSet());
-		return booksById.values().stream()
-				.filter(b -> !b.id().equals(id))
-				.filter(b -> b.categories().stream().anyMatch(c -> categoryIds.contains(c.id()))
-						|| b.authors().stream().anyMatch(a -> authorIds.contains(a.id())))
-				.limit(limit)
-				.map(b -> view(b).toSummary())
-				.toList();
+		Map<UUID, BookSummary> ordered = new LinkedHashMap<>();
+		for (UUID id : ids) {
+			BookSummary summary = found.get(id);
+			if (summary != null) {
+				ordered.put(id, summary);
+			}
+		}
+		return ordered;
+	}
+
+	public List<BookSummary> summaries(List<UUID> ids) {
+		return List.copyOf(summariesById(ids).values());
 	}
 
 	// ---- authors ---------------------------------------------------------------------------
 
 	public PageResponse<Author> authors(String q, int page, int size) {
-		String needle = q == null || q.isBlank() ? null : q.trim().toLowerCase(Locale.ROOT);
-		List<Author> matches = authorsById.values().stream()
-				.filter(a -> needle == null || a.name().toLowerCase(Locale.ROOT).contains(needle))
-				.toList();
-		return PageResponse.of(matches, page, size);
+		StringBuilder where = new StringBuilder(" WHERE 1 = 1");
+		Map<String, Object> params = new HashMap<>();
+		if (q != null && !q.isBlank()) {
+			where.append(" AND LOWER(a.name) LIKE :q ESCAPE '").append(LIKE_ESCAPE).append("'");
+			params.put("q", likePattern(q));
+		}
+		long total = jdbc.sql("SELECT COUNT(*) FROM authors a" + where).params(params)
+				.query(Long.class).single();
+
+		Map<String, Object> pageParams = new HashMap<>(params);
+		pageParams.put("limit", size);
+		pageParams.put("offset", (long) page * size);
+		List<Author> content = jdbc.sql("SELECT a.id, a.name, a.bio, a.photo_url FROM authors a" + where
+				+ " ORDER BY a.name LIMIT :limit OFFSET :offset")
+				.params(pageParams).query(AUTHOR_ROW).list();
+		return PageResponse.of(content, page, size, total);
 	}
 
 	public Author getAuthor(UUID id) {
-		Author author = authorsById.get(id);
-		if (author == null) {
-			throw new NotFoundException("Author not found");
-		}
-		return author;
+		return jdbc.sql("SELECT id, name, bio, photo_url FROM authors WHERE id = :id")
+				.param("id", id).query(AUTHOR_ROW).optional()
+				.orElseThrow(() -> new NotFoundException("Author not found"));
 	}
 
 	public PageResponse<BookSummary> booksByAuthor(UUID authorId, int page, int size) {
 		getAuthor(authorId);
-		List<BookSummary> books = booksById.values().stream()
-				.filter(b -> b.authors().stream().anyMatch(a -> a.id().equals(authorId)))
-				.map(b -> view(b).toSummary())
-				.toList();
-		return PageResponse.of(books, page, size);
+		String where = " WHERE EXISTS (SELECT 1 FROM book_authors ba WHERE ba.book_id = b.id"
+				+ " AND ba.author_id = :authorId)";
+		long total = jdbc.sql("SELECT COUNT(*) FROM books b" + where).param("authorId", authorId)
+				.query(Long.class).single();
+		List<BookRow> rows = jdbc.sql("SELECT " + BOOK_COLUMNS + " FROM books b" + where
+				+ " ORDER BY b.catalog_rank LIMIT :limit OFFSET :offset")
+				.param("authorId", authorId).param("limit", size).param("offset", (long) page * size)
+				.query(BOOK_ROW).list();
+		List<BookSummary> content = assemble(rows).stream().map(Book::toSummary).toList();
+		return PageResponse.of(content, page, size, total);
 	}
 
 	// ---- helpers ---------------------------------------------------------------------------
 
-	private List<BookSummary> summaries(List<UUID> ids, int limit) {
-		return ids.stream().limit(limit).map(id -> view(booksById.get(id)).toSummary()).toList();
+	private List<BookSummary> section(String section, int limit) {
+		List<UUID> ids = jdbc.sql("SELECT book_id FROM home_section_books WHERE section = :section"
+				+ " ORDER BY sort_order LIMIT :limit")
+				.param("section", section).param("limit", limit)
+				.query((rs, n) -> rs.getObject("book_id", UUID.class)).list();
+		return summaries(ids);
 	}
 
-	private static boolean matchesText(Book b, String needle) {
-		return b.title().toLowerCase(Locale.ROOT).contains(needle)
-				|| b.shortDescription().toLowerCase(Locale.ROOT).contains(needle)
-				|| b.authors().stream().anyMatch(a -> a.name().toLowerCase(Locale.ROOT).contains(needle));
-	}
-
-	/** "relevance" keeps catalogue order; "bestselling" ranks by rating in this seeded catalogue. */
-	private static Comparator<Book> comparator(String sort) {
+	/** Allowlisted sort fragments; the client value only selects one, it is never concatenated. */
+	private static String orderBy(String sort) {
 		if (sort == null) {
-			return (a, b) -> 0;
+			return "b.catalog_rank";
 		}
 		return switch (sort) {
-			case "price_asc" -> Comparator.comparing(b -> b.price().amount());
-			case "price_desc" -> Comparator.comparing((Book b) -> b.price().amount()).reversed();
-			case "newest" -> Comparator.comparing(Book::publishedDate).reversed();
-			case "bestselling" -> Comparator.comparing(Book::rating).reversed();
-			default -> (a, b) -> 0;
+			case "price_asc" -> "b.price ASC, b.catalog_rank";
+			case "price_desc" -> "b.price DESC, b.catalog_rank";
+			case "newest" -> "b.published_date DESC NULLS LAST, b.catalog_rank";
+			case "bestselling" -> "b.rating DESC NULLS LAST, b.catalog_rank";
+			default -> "b.catalog_rank";
 		};
 	}
 
+	private static String likePattern(String text) {
+		String escaped = text.trim().toLowerCase(Locale.ROOT)
+				.replace(String.valueOf(LIKE_ESCAPE), "" + LIKE_ESCAPE + LIKE_ESCAPE)
+				.replace("%", LIKE_ESCAPE + "%")
+				.replace("_", LIKE_ESCAPE + "_");
+		return "%" + escaped + "%";
+	}
+
+	/** Attaches authors, genres and categories to the rows using one query per relation. */
+	private List<Book> assemble(List<BookRow> rows) {
+		if (rows.isEmpty()) {
+			return List.of();
+		}
+		List<UUID> ids = rows.stream().map(BookRow::id).toList();
+
+		Map<UUID, List<AuthorSummary>> authors = group(jdbc.sql(
+				"SELECT ba.book_id, a.id, a.name FROM book_authors ba JOIN authors a ON a.id = ba.author_id"
+						+ " WHERE ba.book_id IN (:ids) ORDER BY ba.sort_order, a.name")
+				.param("ids", ids)
+				.query((rs, n) -> new Link<AuthorSummary>(rs.getObject("book_id", UUID.class),
+						new AuthorSummary(rs.getObject("id", UUID.class), rs.getString("name"))))
+				.list());
+		Map<UUID, List<String>> genres = group(jdbc.sql(
+				"SELECT book_id, genre FROM book_genres WHERE book_id IN (:ids) ORDER BY sort_order")
+				.param("ids", ids)
+				.query((rs, n) -> new Link<String>(rs.getObject("book_id", UUID.class), rs.getString("genre")))
+				.list());
+		Map<UUID, List<Category>> categories = group(jdbc.sql(
+				"SELECT bc.book_id, c.id, c.name FROM book_categories bc JOIN categories c"
+						+ " ON c.id = bc.category_id WHERE bc.book_id IN (:ids) ORDER BY c.sort_order")
+				.param("ids", ids)
+				.query((rs, n) -> new Link<Category>(rs.getObject("book_id", UUID.class),
+						new Category(rs.getObject("id", UUID.class), rs.getString("name"))))
+				.list());
+
+		return rows.stream().map(r -> new Book(
+				r.id(), r.title(), authors.getOrDefault(r.id(), List.of()), r.shortDescription(),
+				r.coverImageUrl(), r.format(), genres.getOrDefault(r.id(), List.of()), r.price(),
+				estimatedDelivery(r.format()), r.description(), categories.getOrDefault(r.id(), List.of()),
+				r.language(), r.isbn(), r.publisher(), r.publishedDate(), r.pageCount(), r.inStock(),
+				r.rating())).toList();
+	}
+
 	/** eBooks are delivered instantly; physical books get a rolling estimate. */
-	private static Book view(Book book) {
-		LocalDate eta = book.format() == BookFormat.EBOOK ? null : LocalDate.now().plusDays(DELIVERY_DAYS);
-		return book.withEstimatedDeliveryDate(eta);
+	private static LocalDate estimatedDelivery(BookFormat format) {
+		return format == BookFormat.EBOOK ? null : LocalDate.now().plusDays(DELIVERY_DAYS);
 	}
 
-	private void addAuthor(String name, String bio) {
-		UUID id = stableId("author", name);
-		authorsById.put(id, new Author(id, name, bio, null, null));
+	private static <T> Map<UUID, List<T>> group(List<Link<T>> links) {
+		Map<UUID, List<T>> grouped = new HashMap<>();
+		for (Link<T> link : links) {
+			grouped.computeIfAbsent(link.bookId(), k -> new ArrayList<>()).add(link.value());
+		}
+		return grouped;
 	}
 
-	private UUID addBook(String title, String authorName, String shortDescription, BookFormat format,
-			List<String> genres, long priceInr, List<String> categoryNames, LocalDate published, int pages,
-			double rating) {
-		Author author = authorsById.get(stableId("author", authorName));
-		List<Category> bookCategories = categories.stream().filter(c -> categoryNames.contains(c.name())).toList();
-		UUID id = stableId("book", title);
-		booksById.put(id, new Book(id, title, List.of(author.toSummary()), shortDescription, null, format, genres,
-				Money.inr(priceInr), null, shortDescription, bookCategories, ENGLISH, null, null, published, pages,
-				true, rating));
-		return id;
-	}
-
-	private static UUID stableId(String kind, String name) {
-		return UUID.nameUUIDFromBytes((kind + ":" + name).getBytes(StandardCharsets.UTF_8));
+	private static Double toDouble(BigDecimal value) {
+		return Objects.isNull(value) ? null : value.doubleValue();
 	}
 }

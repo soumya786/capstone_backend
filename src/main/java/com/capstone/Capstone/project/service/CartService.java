@@ -1,78 +1,99 @@
 package com.capstone.Capstone.project.service;
 
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 
 import com.capstone.Capstone.project.exception.ConflictException;
 import com.capstone.Capstone.project.exception.NotFoundException;
 import com.capstone.Capstone.project.model.Book;
+import com.capstone.Capstone.project.model.BookSummary;
 import com.capstone.Capstone.project.model.Cart;
 import com.capstone.Capstone.project.model.CartItem;
 import com.capstone.Capstone.project.model.Money;
 
+/** Shopping cart stored in the {@code cart_items} table, one row per user and book. */
 @Service
 public class CartService {
 
 	static final int MAX_QUANTITY = 20;
 
-	private final CatalogService catalog;
-	private final Map<String, Map<UUID, Integer>> carts = new ConcurrentHashMap<>();
+	private record Line(UUID bookId, int quantity) {
+	}
 
-	public CartService(CatalogService catalog) {
+	private final JdbcClient jdbc;
+	private final CatalogService catalog;
+
+	public CartService(JdbcClient jdbc, CatalogService catalog) {
+		this.jdbc = jdbc;
 		this.catalog = catalog;
 	}
 
-	public synchronized Cart get(String userId) {
-		return view(items(userId));
+	public Cart get(String userId) {
+		List<Line> lines = jdbc.sql("SELECT book_id, quantity FROM cart_items WHERE user_id = :u"
+				+ " ORDER BY added_at, book_id")
+				.param("u", userId)
+				.query((rs, n) -> new Line(rs.getObject("book_id", UUID.class), rs.getInt("quantity")))
+				.list();
+		Map<UUID, BookSummary> books = catalog.summariesById(lines.stream().map(Line::bookId).toList());
+
+		List<CartItem> items = lines.stream().filter(l -> books.containsKey(l.bookId())).map(l -> {
+			BookSummary book = books.get(l.bookId());
+			return new CartItem(book, l.quantity(), book.price().times(l.quantity()));
+		}).toList();
+		Money subtotal = items.stream().map(CartItem::lineTotal).reduce(Money.zero(), Money::plus);
+		int count = items.stream().mapToInt(CartItem::quantity).sum();
+		return new Cart(items, count, subtotal);
 	}
 
-	public synchronized Cart add(String userId, UUID bookId, int quantity) {
+	public Cart add(String userId, UUID bookId, int quantity) {
 		Book book = catalog.getBook(bookId);
 		if (!book.inStock()) {
 			throw new ConflictException("Book is out of stock");
 		}
-		Map<UUID, Integer> items = items(userId);
-		items.merge(bookId, quantity, (current, added) -> Math.min(MAX_QUANTITY, current + added));
-		return view(items);
+		if (increase(userId, bookId, quantity) == 0) {
+			try {
+				jdbc.sql("INSERT INTO cart_items (user_id, book_id, quantity) VALUES (:u, :b, :q)")
+						.param("u", userId).param("b", bookId).param("q", Math.min(quantity, MAX_QUANTITY))
+						.update();
+			} catch (DuplicateKeyException raced) {
+				// Another request created the row between our UPDATE and INSERT; add to it instead.
+				increase(userId, bookId, quantity);
+			}
+		}
+		return get(userId);
 	}
 
-	public synchronized Cart update(String userId, UUID bookId, int quantity) {
-		Map<UUID, Integer> items = items(userId);
-		if (!items.containsKey(bookId)) {
+	public Cart update(String userId, UUID bookId, int quantity) {
+		int updated = jdbc.sql("UPDATE cart_items SET quantity = :q WHERE user_id = :u AND book_id = :b")
+				.param("q", quantity).param("u", userId).param("b", bookId).update();
+		if (updated == 0) {
 			throw new NotFoundException("Book is not in the cart");
 		}
-		items.put(bookId, quantity);
-		return view(items);
+		return get(userId);
 	}
 
-	public synchronized Cart remove(String userId, UUID bookId) {
-		Map<UUID, Integer> items = items(userId);
-		if (items.remove(bookId) == null) {
+	public Cart remove(String userId, UUID bookId) {
+		int removed = jdbc.sql("DELETE FROM cart_items WHERE user_id = :u AND book_id = :b")
+				.param("u", userId).param("b", bookId).update();
+		if (removed == 0) {
 			throw new NotFoundException("Book is not in the cart");
 		}
-		return view(items);
+		return get(userId);
 	}
 
-	public synchronized void clear(String userId) {
-		carts.remove(userId);
+	public void clear(String userId) {
+		jdbc.sql("DELETE FROM cart_items WHERE user_id = :u").param("u", userId).update();
 	}
 
-	private Map<UUID, Integer> items(String userId) {
-		return carts.computeIfAbsent(userId, k -> new LinkedHashMap<>());
-	}
-
-	private Cart view(Map<UUID, Integer> items) {
-		List<CartItem> lines = items.entrySet().stream().map(e -> {
-			Book book = catalog.getBook(e.getKey());
-			return new CartItem(book.toSummary(), e.getValue(), book.price().times(e.getValue()));
-		}).toList();
-		Money subtotal = lines.stream().map(CartItem::lineTotal).reduce(Money.zero(), Money::plus);
-		int count = lines.stream().mapToInt(CartItem::quantity).sum();
-		return new Cart(lines, count, subtotal);
+	private int increase(String userId, UUID bookId, int quantity) {
+		return jdbc.sql("UPDATE cart_items SET quantity = LEAST(:max, quantity + :q)"
+				+ " WHERE user_id = :u AND book_id = :b")
+				.param("max", MAX_QUANTITY).param("q", quantity).param("u", userId).param("b", bookId)
+				.update();
 	}
 }

@@ -1,6 +1,7 @@
 package com.capstone.Capstone.project.controller;
 
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import org.springframework.http.HttpStatus;
@@ -46,7 +47,9 @@ public class AuthorController {
 		if (jwt == null) {
 			return result;
 		}
-		List<Author> marked = result.content().stream().map(a -> withFollowing(a, jwt)).toList();
+		Set<UUID> followed = library.followedIds(jwt.getSubject());
+		List<Author> marked = result.content().stream()
+				.map(a -> a.withFollowing(followed.contains(a.id()))).toList();
 		return new PageResponse<>(marked, result.page(), result.size(), result.totalElements(),
 				result.totalPages());
 	}
@@ -54,7 +57,7 @@ public class AuthorController {
 	@GetMapping("/authors/{authorId}")
 	public Author author(@PathVariable UUID authorId, @AuthenticationPrincipal Jwt jwt) {
 		Author author = catalog.getAuthor(authorId);
-		return jwt == null ? author : withFollowing(author, jwt);
+		return jwt == null ? author : author.withFollowing(library.isFollowing(jwt.getSubject(), authorId));
 	}
 
 	@GetMapping("/authors/{authorId}/books")
@@ -81,7 +84,4 @@ public class AuthorController {
 		library.unfollow(jwt.getSubject(), authorId);
 	}
 
-	private Author withFollowing(Author author, Jwt jwt) {
-		return author.withFollowing(library.isFollowing(jwt.getSubject(), author.id()));
-	}
 }
